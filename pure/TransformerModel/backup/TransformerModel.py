@@ -1,0 +1,341 @@
+import math
+from typing import Optional
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class ResidualBlock1D(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, stride: int = 1, dropout: float = 0.1):
+        super().__init__()
+        self.conv1 = nn.Conv1d(
+            in_channels, 
+            out_channels, 
+            kernel_size=3, 
+            stride=stride, 
+            padding=1, 
+            bias=False
+        )
+        self.bn1 = nn.BatchNorm1d(out_channels)
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(dropout)
+        self.conv2 = nn.Conv1d(
+            out_channels, 
+            out_channels, 
+            kernel_size=3, 
+            stride=1, 
+            padding=1, 
+            bias=False
+        )
+        self.bn2 = nn.BatchNorm1d(out_channels)
+
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm1d(out_channels),
+            )
+        else:
+            self.shortcut = nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = self.shortcut(x)
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.act(out)
+        out = self.drop(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = self.act(out + residual)
+        return out
+
+
+class MultiScaleResNet1D(nn.Module):
+    """
+    ResNet backbone with multi-scale fusion for 1D IR spectra.
+    Returns feature map [B, d_model, S].
+    """
+
+    def __init__(self, d_model: int = 512, dropout: float = 0.1, multiscale_target: str = "mid"):
+        super().__init__()
+        self.multiscale_target = multiscale_target
+
+        self.stem = nn.Sequential(
+            nn.Conv1d(1, 64, kernel_size=7, stride=2, padding=3, bias=False),
+            nn.BatchNorm1d(64),
+            nn.GELU(),
+        )
+
+        self.stage1 = nn.Sequential(
+            ResidualBlock1D(64, 128, stride=2, dropout=dropout),
+            ResidualBlock1D(128, 128, stride=1, dropout=dropout),
+        )
+        self.stage2 = nn.Sequential(
+            ResidualBlock1D(128, 256, stride=2, dropout=dropout),
+            ResidualBlock1D(256, 256, stride=1, dropout=dropout),
+        )
+        self.stage3 = nn.Sequential(
+            ResidualBlock1D(256, d_model, stride=2, dropout=dropout),
+            ResidualBlock1D(d_model, d_model, stride=1, dropout=dropout),
+        )
+
+        self.proj_s1 = nn.Conv1d(128, d_model, kernel_size=1, bias=False)
+        self.proj_s2 = nn.Conv1d(256, d_model, kernel_size=1, bias=False)
+        self.proj_s3 = nn.Conv1d(d_model, d_model, kernel_size=1, bias=False)
+        self.fuse = nn.Sequential(
+            nn.Conv1d(d_model * 3, d_model, kernel_size=1, bias=False),
+            nn.BatchNorm1d(d_model),
+            nn.GELU(),
+        )
+
+    def _resize(self, x: torch.Tensor, target_len: int) -> torch.Tensor:
+        if x.size(-1) == target_len:
+            return x
+        return F.interpolate(x, size=target_len, mode="linear", align_corners=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, 1, L]
+        x = self.stem(x)
+        s1 = self.stage1(x)  # high resolution branch
+        s2 = self.stage2(s1)  # medium resolution branch
+        s3 = self.stage3(s2)  # low resolution branch
+
+        if self.multiscale_target == "high":
+            target_len = s1.size(-1)
+        elif self.multiscale_target == "low":
+            target_len = s3.size(-1)
+        else:
+            target_len = s2.size(-1)
+
+        f1 = self._resize(self.proj_s1(s1), target_len)
+        f2 = self._resize(self.proj_s2(s2), target_len)
+        f3 = self._resize(self.proj_s3(s3), target_len)
+        fused = self.fuse(torch.cat([f1, f2, f3], dim=1))
+        return fused
+
+
+class ConvFeatureEncoder(nn.Module):
+    """
+    Encode IR spectrum + molecular formula into a memory sequence for Transformer decoder.
+    """
+
+    def __init__(
+        self,
+        formula_dim: int,
+        d_model: int = 512,
+        max_memory_len: int = 1024,
+        input_points: int = 1652,
+        nhead: int = 8,
+        buffer_layers: int = 2,
+        buffer_dim_feedforward: int = 2048,
+        dropout: float = 0.1,
+        multiscale_target: str = "mid",
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.max_memory_len = max_memory_len
+        self.input_points = input_points
+        self.buffer_layers = int(buffer_layers)
+
+        self.cnn = MultiScaleResNet1D(d_model=d_model, dropout=dropout, multiscale_target=multiscale_target)
+        self.formula_proj = nn.Sequential(
+            nn.Linear(formula_dim, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
+
+        self.memory_pos_emb = nn.Embedding(max_memory_len, d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(d_model)
+
+        if self.buffer_layers > 0:
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=nhead,
+                dim_feedforward=buffer_dim_feedforward,
+                dropout=dropout,
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,
+            )
+            self.buffer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=self.buffer_layers)
+            self.buffer_norm = nn.LayerNorm(d_model)
+        else:
+            self.buffer_encoder = None
+            self.buffer_norm = None
+
+    def forward(self, ir_spectrum: torch.Tensor, formula_vec: torch.Tensor) -> torch.Tensor:
+        # ir_spectrum: [B, L]
+        x = ir_spectrum.unsqueeze(1) if ir_spectrum.dim() == 2 else ir_spectrum
+        feat = self.cnn(x)  # [B, d_model, S]
+        feat = feat.transpose(1, 2)  # [B, S, d_model]
+
+        formula_token = self.formula_proj(formula_vec).unsqueeze(1)  # [B, 1, d_model]
+        memory = torch.cat([formula_token, feat], dim=1)  # [B, S+1, d_model]
+
+        # Clamp memory length to avoid overflow when high-resolution multi-scale is used.
+        if memory.size(1) > self.max_memory_len:
+            formula_part = memory[:, :1, :]
+            spectral_part = memory[:, 1:, :].transpose(1, 2)  # [B, D, S]
+            target_spec_len = max(1, self.max_memory_len - 1)
+            spectral_part = F.adaptive_avg_pool1d(spectral_part, output_size=target_spec_len).transpose(1, 2)
+            memory = torch.cat([formula_part, spectral_part], dim=1)
+
+        mem_len = memory.size(1)
+        pos_ids = torch.arange(mem_len, device=memory.device).unsqueeze(0)
+        memory = self.norm(self.dropout(memory + self.memory_pos_emb(pos_ids)))
+
+        if self.buffer_encoder is not None:
+            memory = self.buffer_encoder(memory)
+            memory = self.buffer_norm(memory)
+        return memory
+
+
+class TransformerSMILESDecoder(nn.Module):
+    def __init__(
+        self,
+        vocab_size: int,
+        d_model: int = 512,
+        nhead: int = 8,
+        num_layers: int = 6,
+        dim_feedforward: int = 2048,
+        dropout: float = 0.1,
+        max_tgt_len: int = 256,
+        pad_id: int = 0,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.pad_id = pad_id
+        self.max_tgt_len = max_tgt_len
+
+        self.token_emb = nn.Embedding(vocab_size, d_model)
+        self.tgt_pos_emb = nn.Embedding(max_tgt_len, d_model)
+
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=False,
+        )
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(d_model)
+        self.fc_out = nn.Linear(d_model, vocab_size)
+
+    def _causal_mask(self, size: int, device: torch.device) -> torch.Tensor:
+        mask = torch.full((size, size), float("-inf"), device=device)
+        return torch.triu(mask, diagonal=1)
+
+    def forward(self, memory: torch.Tensor, tgt_ids: torch.Tensor) -> torch.Tensor:
+        # memory: [B, S, D], tgt_ids: [B, T]
+        bsz, tgt_len = tgt_ids.size()
+        if tgt_len > self.max_tgt_len:
+            raise ValueError(f"tgt_len {tgt_len} > max_tgt_len {self.max_tgt_len}")
+
+        pos_ids = torch.arange(tgt_len, device=tgt_ids.device).unsqueeze(0).expand(bsz, tgt_len)
+        tgt_emb = self.token_emb(tgt_ids) * math.sqrt(self.d_model)
+        tgt_emb = tgt_emb + self.tgt_pos_emb(pos_ids)
+        tgt_emb = self.norm(self.dropout(tgt_emb))
+
+        tgt_mask = self._causal_mask(tgt_len, tgt_ids.device)
+        tgt_key_padding_mask = tgt_ids.eq(self.pad_id)
+
+        # transformer decoder expects [T, B, D]
+        tgt = tgt_emb.transpose(0, 1)
+        mem = memory.transpose(0, 1)
+
+        decoded = self.decoder(
+            tgt=tgt,
+            memory=mem,
+            tgt_mask=tgt_mask,
+            tgt_key_padding_mask=tgt_key_padding_mask,
+        )
+
+        decoded = decoded.transpose(0, 1)  # [B, T, D]
+        logits = self.fc_out(decoded)  # [B, T, V]
+        return logits
+
+
+class IRFormulaTransformer(nn.Module):
+    def __init__(
+        self,
+        vocab_size: int,
+        formula_dim: int,
+        input_points: int = 1652,
+        d_model: int = 512,
+        nhead: int = 8,
+        num_layers: int = 6,
+        dim_feedforward: int = 2048,
+        dropout: float = 0.1,
+        max_tgt_len: int = 256,
+        max_memory_len: int = 1024,
+        encoder_buffer_layers: int = 2,
+        encoder_buffer_dim_feedforward: Optional[int] = None,
+        encoder_multiscale_target: str = "mid",
+        pad_id: int = 0,
+        sos_id: int = 1,
+        eos_id: int = 2,
+    ):
+        super().__init__()
+        self.pad_id = pad_id
+        self.sos_id = sos_id
+        self.eos_id = eos_id
+
+        buffer_ffn = dim_feedforward if encoder_buffer_dim_feedforward is None else int(encoder_buffer_dim_feedforward)
+        self.encoder = ConvFeatureEncoder(
+            formula_dim=formula_dim,
+            d_model=d_model,
+            max_memory_len=max_memory_len,
+            input_points=input_points,
+            nhead=nhead,
+            buffer_layers=encoder_buffer_layers,
+            buffer_dim_feedforward=buffer_ffn,
+            dropout=dropout,
+            multiscale_target=encoder_multiscale_target,
+        )
+        self.decoder = TransformerSMILESDecoder(
+            vocab_size=vocab_size,
+            d_model=d_model,
+            nhead=nhead,
+            num_layers=num_layers,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            max_tgt_len=max_tgt_len,
+            pad_id=pad_id,
+        )
+
+    def forward(self, ir_spectrum: torch.Tensor, formula_vec: torch.Tensor, target_smiles: torch.Tensor) -> torch.Tensor:
+        memory = self.encoder(ir_spectrum, formula_vec)
+        logits = self.decoder(memory, target_smiles)
+        return logits
+
+    @torch.no_grad()
+    def generate(
+        self,
+        ir_spectrum: torch.Tensor,
+        formula_vec: torch.Tensor,
+        max_len: int = 120,
+        sos_id: Optional[int] = None,
+        eos_id: Optional[int] = None,
+    ) -> torch.Tensor:
+        self.eval()
+        sos_id = self.sos_id if sos_id is None else sos_id
+        eos_id = self.eos_id if eos_id is None else eos_id
+
+        bsz = ir_spectrum.size(0)
+        memory = self.encoder(ir_spectrum, formula_vec)
+
+        generated = torch.full((bsz, 1), sos_id, dtype=torch.long, device=ir_spectrum.device)
+        finished = torch.zeros(bsz, dtype=torch.bool, device=ir_spectrum.device)
+
+        for _ in range(max_len - 1):
+            logits = self.decoder(memory, generated)
+            next_token = logits[:, -1, :].argmax(dim=-1)
+            generated = torch.cat([generated, next_token.unsqueeze(1)], dim=1)
+            finished = finished | next_token.eq(eos_id)
+            if torch.all(finished):
+                break
+
+        return generated
