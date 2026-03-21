@@ -17,6 +17,8 @@ if str(ROOT) not in sys.path:
 
 from TransformerModel.TransformerModel import IRFormulaTransformer
 from DiffusionAlign.diffusion_model import DiffusionBundle, build_schedule, q_sample
+from FunctionalGroupModel.IRFunctionalGroupModel import DEFAULT_FUNCTIONAL_GROUPS, functional_group_loss
+from FunctionalGroupModel.functional_group_utils import compute_pos_weight
 from util.dataloader import IRDataset, collate_fn
 from util.tokenizer import build_vocab
 
@@ -92,6 +94,15 @@ USE_DIFFUSION_ALIGN = True
 DIFFUSION_CKPT_PATH = "checkpoints/DiffusionAlign/diffusion_align.pth"
 DIFFUSION_LOSS_WEIGHT = 0.1
 DIFFUSION_TAU = 1.0
+USE_FUNCTIONAL_GROUP_AUX = True
+FUNCTIONAL_GROUP_LABEL_NAMES = DEFAULT_FUNCTIONAL_GROUPS
+FUNCTIONAL_GROUP_CACHE_PATH = "checkpoints/FunctionalGroupModel/transformer_fg_labels.pt"
+FUNCTIONAL_GROUP_LOSS_WEIGHT = 0.15
+FUNCTIONAL_GROUP_LABEL_SMOOTHING = 0.0
+USE_FUNCTIONAL_GROUP_FUSION = True
+FUNCTIONAL_GROUP_DETACH_FUSION = False
+FUNCTIONAL_GROUP_HEAD_DIM = 256
+FUNCTIONAL_GROUP_THRESHOLD = 0.5
 
 
 def get_tokenizer():
@@ -169,6 +180,29 @@ def token_accuracy(logits: torch.Tensor, target: torch.Tensor, pad_id: int = 0):
     correct = ((pred == target) & valid_mask).sum().item()
     total = valid_mask.sum().item()
     return correct, total
+
+
+def unpack_batch(batch):
+    if len(batch) == 4:
+        spectra, formula_vec, smiles_ids, functional_group_targets = batch
+        return spectra, formula_vec, smiles_ids, functional_group_targets
+    spectra, formula_vec, smiles_ids = batch
+    return spectra, formula_vec, smiles_ids, None
+
+
+def multilabel_batch_f1(probs: torch.Tensor, targets: torch.Tensor, threshold: float = 0.5, eps: float = 1e-8):
+    if probs is None or targets is None:
+        return 0.0
+    pred = probs.ge(threshold).float()
+    targets = targets.float()
+    tp = (pred * targets).sum().item()
+    fp = (pred * (1.0 - targets)).sum().item()
+    fn = ((1.0 - pred) * targets).sum().item()
+    precision = tp / max(tp + fp, eps)
+    recall = tp / max(tp + fn, eps)
+    if precision + recall <= eps:
+        return 0.0
+    return float(2.0 * precision * recall / (precision + recall))
 
 
 def soft_token_tanimoto_loss(
@@ -306,26 +340,39 @@ def _normalize_token_seq(ids: torch.Tensor, pad_id: int, sos_id: int, eos_id: in
     return tuple(seq)
 
 
-def validate(model, loader, criterion, device, pad_id: int, tanimoto_ignore_ids: Optional[list] = None):
+def validate(
+    model,
+    loader,
+    criterion,
+    device,
+    pad_id: int,
+    tanimoto_ignore_ids: Optional[list] = None,
+    functional_group_pos_weight: Optional[torch.Tensor] = None,
+):
     model.eval()
     total_loss = 0.0
     total_ce_loss = 0.0
     total_tanimoto_aux_loss = 0.0
     total_soft_tanimoto = 0.0
+    total_fg_loss = 0.0
+    total_fg_f1 = 0.0
     total_correct = 0
     total_tokens = 0
 
     with torch.no_grad():
         val_pbar = tqdm(loader, desc="Validate", leave=False)
-        for spectra, formula_vec, smiles_ids in val_pbar:
+        for batch in val_pbar:
+            spectra, formula_vec, smiles_ids, functional_group_targets = unpack_batch(batch)
             spectra = spectra.to(device)
             formula_vec = formula_vec.to(device)
             smiles_ids = smiles_ids.to(device)
+            if functional_group_targets is not None:
+                functional_group_targets = functional_group_targets.to(device)
 
             decoder_input = smiles_ids[:, :-1]
             target = smiles_ids[:, 1:]
-            outputs = model(spectra, formula_vec, decoder_input)
-            logits = outputs
+            outputs = model(spectra, formula_vec, decoder_input, return_aux=True)
+            logits = outputs["logits"]
             ce_loss = criterion(logits.reshape(-1, logits.shape[-1]), target.reshape(-1))
             if USE_TANIMOTO_AUX_LOSS and TANIMOTO_LOSS_WEIGHT > 0:
                 tanimoto_aux_loss, soft_tanimoto = soft_token_tanimoto_loss(
@@ -338,22 +385,48 @@ def validate(model, loader, criterion, device, pad_id: int, tanimoto_ignore_ids:
                 tanimoto_aux_loss = torch.zeros((), device=logits.device)
                 soft_tanimoto = torch.zeros((), device=logits.device)
             loss = ce_loss + TANIMOTO_LOSS_WEIGHT * tanimoto_aux_loss
+            fg_logits = outputs.get("functional_group_logits")
+            fg_probs = outputs.get("functional_group_probs")
+            if (
+                USE_FUNCTIONAL_GROUP_AUX
+                and functional_group_targets is not None
+                and fg_logits is not None
+            ):
+                fg_loss = functional_group_loss(
+                    fg_logits,
+                    functional_group_targets,
+                    pos_weight=functional_group_pos_weight,
+                    label_smoothing=FUNCTIONAL_GROUP_LABEL_SMOOTHING,
+                )
+                loss = loss + FUNCTIONAL_GROUP_LOSS_WEIGHT * fg_loss
+                fg_f1 = multilabel_batch_f1(fg_probs, functional_group_targets, threshold=FUNCTIONAL_GROUP_THRESHOLD)
+            else:
+                fg_loss = torch.zeros((), device=logits.device)
+                fg_f1 = 0.0
 
             total_loss += loss.item()
             total_ce_loss += ce_loss.item()
             total_tanimoto_aux_loss += tanimoto_aux_loss.item()
             total_soft_tanimoto += soft_tanimoto.item()
+            total_fg_loss += fg_loss.item()
+            total_fg_f1 += fg_f1
             c, t = token_accuracy(logits, target, pad_id=pad_id)
             total_correct += c
             total_tokens += t
-            val_pbar.set_postfix(loss=f"{loss.item():.4f}", tan=f"{soft_tanimoto.item():.4f}")
+            val_pbar.set_postfix(
+                loss=f"{loss.item():.4f}",
+                tan=f"{soft_tanimoto.item():.4f}",
+                fg=f"{fg_loss.item():.4f}",
+            )
 
     avg_loss = total_loss / max(len(loader), 1)
     acc = total_correct / max(total_tokens, 1)
     avg_ce_loss = total_ce_loss / max(len(loader), 1)
     avg_tanimoto_aux_loss = total_tanimoto_aux_loss / max(len(loader), 1)
     avg_soft_tanimoto = total_soft_tanimoto / max(len(loader), 1)
-    return avg_loss, acc, avg_ce_loss, avg_tanimoto_aux_loss, avg_soft_tanimoto
+    avg_fg_loss = total_fg_loss / max(len(loader), 1)
+    avg_fg_f1 = total_fg_f1 / max(len(loader), 1)
+    return avg_loss, acc, avg_ce_loss, avg_tanimoto_aux_loss, avg_soft_tanimoto, avg_fg_loss, avg_fg_f1
 
 
 def evaluate_val_sequence_exact_match(
@@ -371,7 +444,8 @@ def evaluate_val_sequence_exact_match(
     correct = 0
 
     with torch.no_grad():
-        for spectra, formula_vec, smiles_ids in loader:
+        for batch in loader:
+            spectra, formula_vec, smiles_ids, _ = unpack_batch(batch)
             spectra = spectra.to(device)
             formula_vec = formula_vec.to(device)
             generated_ids = model.generate(
@@ -440,6 +514,14 @@ def train_model():
                     "plateau_threshold": PLATEAU_THRESHOLD,
                     "randomize_smiles": RANDOMIZE_SMILES,
                     "randomize_prob": RANDOMIZE_PROB,
+                    "use_functional_group_aux": USE_FUNCTIONAL_GROUP_AUX,
+                    "functional_group_loss_weight": FUNCTIONAL_GROUP_LOSS_WEIGHT,
+                    "functional_group_label_smoothing": FUNCTIONAL_GROUP_LABEL_SMOOTHING,
+                    "use_functional_group_fusion": USE_FUNCTIONAL_GROUP_FUSION,
+                    "functional_group_detach_fusion": FUNCTIONAL_GROUP_DETACH_FUSION,
+                    "functional_group_head_dim": FUNCTIONAL_GROUP_HEAD_DIM,
+                    "functional_group_threshold": FUNCTIONAL_GROUP_THRESHOLD,
+                    "num_functional_groups": len(FUNCTIONAL_GROUP_LABEL_NAMES),
                 },
             )
         except Exception as exc:
@@ -459,6 +541,9 @@ def train_model():
         randomize_smiles=False,
         randomize_prob=0.0,
         seed=SEED,
+        return_functional_groups=USE_FUNCTIONAL_GROUP_AUX,
+        functional_group_label_names=FUNCTIONAL_GROUP_LABEL_NAMES,
+        functional_group_cache_path=FUNCTIONAL_GROUP_CACHE_PATH if USE_FUNCTIONAL_GROUP_AUX else None,
     )
     total_size = len(dataset)
     train_idx, val_idx, test_idx = get_or_create_splits(total_size, SPLIT_PATH)
@@ -466,6 +551,11 @@ def train_model():
     tqdm.write(f"Dataset size: {total_size}")
     tqdm.write(f"Train/Val/Test: {len(train_idx)}/{len(val_idx)}/{len(test_idx)}")
     tqdm.write(f"Formula feature dim: {dataset.formula_dim}")
+    if USE_FUNCTIONAL_GROUP_AUX:
+        tqdm.write(
+            f"Functional-group labels: {len(FUNCTIONAL_GROUP_LABEL_NAMES)} "
+            f"(cache={FUNCTIONAL_GROUP_CACHE_PATH})"
+        )
 
     if RANDOMIZE_SMILES and RANDOMIZE_PROB > 0:
         train_base = IRDataset(
@@ -477,11 +567,19 @@ def train_model():
             randomize_smiles=True,
             randomize_prob=RANDOMIZE_PROB,
             seed=SEED,
+            return_functional_groups=USE_FUNCTIONAL_GROUP_AUX,
+            functional_group_labels=dataset.functional_group_labels if USE_FUNCTIONAL_GROUP_AUX else None,
+            functional_group_label_names=FUNCTIONAL_GROUP_LABEL_NAMES,
         )
         train_dataset = Subset(train_base, train_idx)
     else:
         train_dataset = Subset(dataset, train_idx)
     val_dataset = Subset(dataset, val_idx)
+
+    functional_group_pos_weight = None
+    if USE_FUNCTIONAL_GROUP_AUX and dataset.functional_group_labels is not None:
+        train_fg_labels = dataset.functional_group_labels[train_idx]
+        functional_group_pos_weight = compute_pos_weight(train_fg_labels).to(DEVICE)
 
     train_loader = DataLoader(
         train_dataset,
@@ -515,6 +613,12 @@ def train_model():
         encoder_buffer_dim_feedforward=ENCODER_BUFFER_DIM_FEEDFORWARD,
         encoder_multiscale_target=ENCODER_MULTISCALE_TARGET,
         encoder_use_coordconv=ENCODER_USE_COORDCONV,
+        num_functional_groups=len(FUNCTIONAL_GROUP_LABEL_NAMES) if USE_FUNCTIONAL_GROUP_AUX else 0,
+        use_functional_group_head=USE_FUNCTIONAL_GROUP_AUX,
+        use_functional_group_token=USE_FUNCTIONAL_GROUP_AUX and USE_FUNCTIONAL_GROUP_FUSION,
+        functional_group_head_dim=FUNCTIONAL_GROUP_HEAD_DIM,
+        functional_group_dropout=DROPOUT,
+        functional_group_detach_fusion=FUNCTIONAL_GROUP_DETACH_FUSION,
         pad_id=pad_id,
         sos_id=sos_id,
         eos_id=eos_id,
@@ -617,6 +721,16 @@ def train_model():
                 "diffusion_ckpt_path": DIFFUSION_CKPT_PATH if USE_DIFFUSION_ALIGN else None,
                 "diffusion_loss_weight": DIFFUSION_LOSS_WEIGHT,
                 "diffusion_tau": DIFFUSION_TAU,
+                "use_functional_group_aux": USE_FUNCTIONAL_GROUP_AUX,
+                "functional_group_label_names": list(FUNCTIONAL_GROUP_LABEL_NAMES),
+                "num_functional_groups": len(FUNCTIONAL_GROUP_LABEL_NAMES) if USE_FUNCTIONAL_GROUP_AUX else 0,
+                "functional_group_loss_weight": FUNCTIONAL_GROUP_LOSS_WEIGHT,
+                "functional_group_label_smoothing": FUNCTIONAL_GROUP_LABEL_SMOOTHING,
+                "use_functional_group_fusion": USE_FUNCTIONAL_GROUP_FUSION,
+                "functional_group_detach_fusion": FUNCTIONAL_GROUP_DETACH_FUSION,
+                "functional_group_head_dim": FUNCTIONAL_GROUP_HEAD_DIM,
+                "functional_group_threshold": FUNCTIONAL_GROUP_THRESHOLD,
+                "functional_group_cache_path": FUNCTIONAL_GROUP_CACHE_PATH if USE_FUNCTIONAL_GROUP_AUX else None,
             },
             f,
             ensure_ascii=True,
@@ -640,11 +754,14 @@ def train_model():
         total_masked_patch_loss = 0.0
         total_masked_patch_huber = 0.0
         total_masked_patch_deriv = 0.0
+        total_fg_loss = 0.0
+        total_fg_f1 = 0.0
         total_correct = 0
         total_tokens = 0
 
         train_pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{TRAIN_EPOCH} [train]", leave=False)
-        for spectra, formula_vec, smiles_ids in train_pbar:
+        for batch in train_pbar:
+            spectra, formula_vec, smiles_ids, functional_group_targets = unpack_batch(batch)
             spectra = spectra.to(DEVICE)
             clean_spectra = spectra
             encoder_input_spectra = clean_spectra
@@ -670,16 +787,19 @@ def train_model():
                     recon_input_spectra = recon_input_spectra + torch.randn_like(recon_input_spectra) * SPECTRUM_NOISE_STD
             formula_vec = formula_vec.to(DEVICE)
             smiles_ids = smiles_ids.to(DEVICE)
+            if functional_group_targets is not None:
+                functional_group_targets = functional_group_targets.to(DEVICE)
 
             optimizer.zero_grad()
             decoder_input = smiles_ids[:, :-1]
             target = smiles_ids[:, 1:]
             if USE_MASKED_PATCH_AUX and masked_patch_head is not None:
-                memory = model.encoder(encoder_input_spectra, formula_vec)
-                logits = model.decoder(memory, decoder_input)
+                outputs = model(encoder_input_spectra, formula_vec, decoder_input, return_aux=True)
+                memory = outputs["memory"]
+                logits = outputs["logits"]
                 recon_memory = memory
                 if not MASKED_PATCH_APPLY_TO_SEQ2SEQ:
-                    recon_memory = model.encoder(recon_input_spectra, formula_vec)
+                    recon_memory, _, _ = model._encode_with_functional_groups(recon_input_spectra, formula_vec)
                 recon_spectra = masked_patch_head(recon_memory)
                 masked_patch_loss, masked_patch_huber, masked_patch_deriv = masked_patch_reconstruction_loss(
                     recon_spectra,
@@ -688,8 +808,8 @@ def train_model():
                     deriv_weight=MASKED_PATCH_DERIV_WEIGHT,
                 )
             else:
-                outputs = model(encoder_input_spectra, formula_vec, decoder_input)
-                logits = outputs
+                outputs = model(encoder_input_spectra, formula_vec, decoder_input, return_aux=True)
+                logits = outputs["logits"]
             ce_loss = criterion(logits.reshape(-1, logits.shape[-1]), target.reshape(-1))
             if USE_TANIMOTO_AUX_LOSS and TANIMOTO_LOSS_WEIGHT > 0:
                 tanimoto_aux_loss, soft_tanimoto = soft_token_tanimoto_loss(
@@ -701,6 +821,24 @@ def train_model():
             else:
                 tanimoto_aux_loss = torch.zeros((), device=logits.device)
                 soft_tanimoto = torch.zeros((), device=logits.device)
+
+            fg_logits = outputs.get("functional_group_logits")
+            fg_probs = outputs.get("functional_group_probs")
+            if (
+                USE_FUNCTIONAL_GROUP_AUX
+                and functional_group_targets is not None
+                and fg_logits is not None
+            ):
+                fg_loss = functional_group_loss(
+                    fg_logits,
+                    functional_group_targets,
+                    pos_weight=functional_group_pos_weight,
+                    label_smoothing=FUNCTIONAL_GROUP_LABEL_SMOOTHING,
+                )
+                fg_f1 = multilabel_batch_f1(fg_probs, functional_group_targets, threshold=FUNCTIONAL_GROUP_THRESHOLD)
+            else:
+                fg_loss = torch.zeros((), device=logits.device)
+                fg_f1 = 0.0
 
             diff_loss = None
             if USE_DIFFUSION_ALIGN and diffusion_bundle is not None:
@@ -730,6 +868,8 @@ def train_model():
                 diff_loss = F.mse_loss(pred_noise, noise)
 
             loss = ce_loss + TANIMOTO_LOSS_WEIGHT * tanimoto_aux_loss
+            if USE_FUNCTIONAL_GROUP_AUX and fg_logits is not None:
+                loss = loss + FUNCTIONAL_GROUP_LOSS_WEIGHT * fg_loss
             if USE_MASKED_PATCH_AUX and masked_patch_head is not None:
                 loss = loss + MASKED_PATCH_LOSS_WEIGHT * masked_patch_loss
             if diff_loss is not None:
@@ -747,6 +887,8 @@ def train_model():
             total_masked_patch_loss += masked_patch_loss.item()
             total_masked_patch_huber += masked_patch_huber.item()
             total_masked_patch_deriv += masked_patch_deriv.item()
+            total_fg_loss += fg_loss.item()
+            total_fg_f1 += fg_f1
             c, t = token_accuracy(logits, target, pad_id=pad_id)
             total_correct += c
             total_tokens += t
@@ -755,6 +897,7 @@ def train_model():
                     loss=f"{loss.item():.4f}",
                     ce=f"{ce_loss.item():.4f}",
                     tan=f"{soft_tanimoto.item():.4f}",
+                    fg=f"{fg_loss.item():.4f}",
                     mpatch=f"{masked_patch_loss.item():.4f}",
                 )
             else:
@@ -762,6 +905,7 @@ def train_model():
                     loss=f"{loss.item():.4f}",
                     ce=f"{ce_loss.item():.4f}",
                     tan=f"{soft_tanimoto.item():.4f}",
+                    fg=f"{fg_loss.item():.4f}",
                     mpatch=f"{masked_patch_loss.item():.4f}",
                     diff=f"{diff_loss.item():.4f}",
                 )
@@ -773,14 +917,17 @@ def train_model():
         train_masked_patch_loss = total_masked_patch_loss / max(len(train_loader), 1)
         train_masked_patch_huber = total_masked_patch_huber / max(len(train_loader), 1)
         train_masked_patch_deriv = total_masked_patch_deriv / max(len(train_loader), 1)
+        train_fg_loss = total_fg_loss / max(len(train_loader), 1)
+        train_fg_f1 = total_fg_f1 / max(len(train_loader), 1)
         train_acc = total_correct / max(total_tokens, 1)
-        val_loss, val_acc, val_ce_loss, val_tanimoto_aux_loss, val_soft_tanimoto = validate(
+        val_loss, val_acc, val_ce_loss, val_tanimoto_aux_loss, val_soft_tanimoto, val_fg_loss, val_fg_f1 = validate(
             model,
             val_loader,
             criterion,
             DEVICE,
             pad_id,
             tanimoto_ignore_ids=tanimoto_ignore_ids,
+            functional_group_pos_weight=functional_group_pos_weight,
         )
         compute_seq_em = (epoch == 0) or ((epoch + 1) % VAL_SEQ_EM_EVERY == 0)
         if compute_seq_em:
@@ -808,10 +955,12 @@ def train_model():
             f"lr={lr_now:.2e} "
             f"train_loss={train_loss:.4f} train_ce={train_ce_loss:.4f} "
             f"train_tan_loss={train_tanimoto_aux_loss:.4f} train_tan={train_soft_tanimoto:.4f} "
+            f"train_fg_loss={train_fg_loss:.4f} train_fg_f1={train_fg_f1:.4f} "
             f"train_mpatch={train_masked_patch_loss:.4f} "
             f"train_acc={train_acc:.4%} | "
             f"val_loss={val_loss:.4f} val_ce={val_ce_loss:.4f} "
             f"val_tan_loss={val_tanimoto_aux_loss:.4f} val_tan={val_soft_tanimoto:.4f} "
+            f"val_fg_loss={val_fg_loss:.4f} val_fg_f1={val_fg_f1:.4f} "
             f"val_acc={val_acc:.4%} val_seq_em={val_seq_em:.4%}"
         )
 
@@ -824,6 +973,8 @@ def train_model():
                     "train_ce_loss": train_ce_loss,
                     "train_tanimoto_aux_loss": train_tanimoto_aux_loss,
                     "train_soft_tanimoto": train_soft_tanimoto,
+                    "train_functional_group_loss": train_fg_loss,
+                    "train_functional_group_f1": train_fg_f1,
                     "train_masked_patch_loss": train_masked_patch_loss,
                     "train_masked_patch_huber": train_masked_patch_huber,
                     "train_masked_patch_deriv": train_masked_patch_deriv,
@@ -832,6 +983,8 @@ def train_model():
                     "val_ce_loss": val_ce_loss,
                     "val_tanimoto_aux_loss": val_tanimoto_aux_loss,
                     "val_soft_tanimoto": val_soft_tanimoto,
+                    "val_functional_group_loss": val_fg_loss,
+                    "val_functional_group_f1": val_fg_f1,
                     "val_acc": val_acc,
                     "val_seq_em": val_seq_em,
                 }

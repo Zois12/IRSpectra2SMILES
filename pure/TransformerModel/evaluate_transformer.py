@@ -125,12 +125,27 @@ def build_model(model_path: str, config: Dict, device: torch.device) -> IRFormul
         encoder_buffer_dim_feedforward=config.get("encoder_buffer_dim_feedforward", config["dim_feedforward"]),
         encoder_multiscale_target=config.get("encoder_multiscale_target", "mid"),
         encoder_use_coordconv=config.get("encoder_use_coordconv", False),
+        num_functional_groups=config.get("num_functional_groups", 0),
+        use_functional_group_head=config.get("use_functional_group_aux", False),
+        use_functional_group_token=config.get("use_functional_group_aux", False)
+        and config.get("use_functional_group_fusion", False),
+        functional_group_head_dim=config.get("functional_group_head_dim", 256),
+        functional_group_dropout=config.get("dropout", 0.1),
+        functional_group_detach_fusion=config.get("functional_group_detach_fusion", False),
         pad_id=config["pad_id"],
         sos_id=config["sos_id"],
         eos_id=config["eos_id"],
     )
     state_dict = torch.load(model_path, map_location="cpu")
-    model.load_state_dict(state_dict)
+    try:
+        model.load_state_dict(state_dict)
+    except RuntimeError as exc:
+        incompatible = model.load_state_dict(state_dict, strict=False)
+        print(
+            "Warning: Transformer checkpoint mismatch; loaded with strict=False. "
+            f"missing_keys={list(incompatible.missing_keys)} unexpected_keys={list(incompatible.unexpected_keys)}"
+        )
+        print(f"Original load error: {exc}")
     model = model.to(device)
     model.eval()
     return model
