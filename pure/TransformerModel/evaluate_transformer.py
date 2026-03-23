@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import random
 import re
 import sys
@@ -825,7 +826,7 @@ def evaluate_generation(
     functional_group_beam_multiplier: float = 2.0,
     functional_group_max_beam_size: int = 40,
     functional_group_max_regenerations: int = 2,
-) -> Tuple[float, List[Dict[str, str]], Dict[str, float]]:
+) -> Tuple[float, List[Dict[str, str]], Dict[str, float], List[Dict[str, object]]]:
     rng = random.Random(seed)
     total = len(dataset)
     sample_count = min(sample_count, total)
@@ -858,6 +859,7 @@ def evaluate_generation(
     fg_constraint_final_satisfied_count = 0
     fg_constraint_regeneration_count = 0
     fg_constraint_required_group_sum = 0.0
+    topk_all_wrong_samples: List[Dict[str, object]] = []
     fp_cache: Dict[str, object] = {}
     mol_cache: Dict[str, Optional[object]] = {}
     fg_label_cache: Dict[str, List[int]] = {}
@@ -1047,6 +1049,7 @@ def evaluate_generation(
 
                 samples.append(
                     {
+                        "sample_index": int(batch_indices[i]),
                         "gt": gt,
                         "greedy_pred": greedy_pred,
                         "beam_top1_pred": beam_top1_pred,
@@ -1064,6 +1067,28 @@ def evaluate_generation(
                         "functional_group_constraint_beam_size": int(fg_constraint_meta["searched_beam_size"]),
                     }
                 )
+
+                if gt not in topk_smiles:
+                    topk_all_wrong_samples.append(
+                        {
+                            "sample_index": int(batch_indices[i]),
+                            "gt": gt,
+                            "greedy_pred": greedy_pred,
+                            "beam_top1_pred": beam_top1_pred,
+                            "consensus_pred": consensus_pred,
+                            "ir_rerank_pred": rerank_pred,
+                            "consensus_cluster_size": int(len(consensus_cluster)),
+                            "consensus_cluster_internal_tanimoto": float(consensus_internal_tanimoto),
+                            "required_functional_groups": list(required_fg_names),
+                            "required_functional_group_probs": dict(required_fg_scores),
+                            "functional_group_constraint_triggered": bool(fg_constraint_meta["triggered"]),
+                            "functional_group_constraint_found": bool(fg_constraint_meta["found_satisfying_candidates"]),
+                            "functional_group_constraint_regenerated": bool(fg_constraint_meta["regenerated"]),
+                            "functional_group_constraint_final_satisfied": bool(final_fg_satisfied),
+                            "functional_group_constraint_beam_size": int(fg_constraint_meta["searched_beam_size"]),
+                            "topk_candidates": list(top10_examples),
+                        }
+                    )
 
                 gt_elem_counts = formula_vec_to_counts(formula_batch[i], idx_to_elem)
                 pred_elem_counts = parse_smiles_element_counts(rerank_pred if smiles2ir_model is not None else consensus_pred)
@@ -1124,7 +1149,195 @@ def evaluate_generation(
         elem_metrics["ir_rerank_gain_vs_beam_top1"] = (
             elem_metrics["ir_rerank_top1_exact_match_rate"] - elem_metrics["beam_top1_exact_match_rate"]
         )
-    return em_rate, samples, elem_metrics
+    elem_metrics["topk_all_wrong_rate"] = len(topk_all_wrong_samples) / max(len(samples), 1)
+    elem_metrics["topk_all_wrong_count"] = len(topk_all_wrong_samples)
+    return em_rate, samples, elem_metrics, topk_all_wrong_samples
+
+
+def export_topk_failures_to_excel(
+    failures: List[Dict[str, object]],
+    output_path: str,
+    top_k: int,
+) -> Tuple[str, str]:
+    out_dir = os.path.dirname(output_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    try:
+        from openpyxl import Workbook
+    except Exception as exc:
+        csv_path = str(Path(output_path).with_suffix(".csv"))
+        summary_headers = [
+            "sample_index",
+            "gt",
+            "greedy_pred",
+            "beam_top1_pred",
+            "consensus_pred",
+            "ir_rerank_pred",
+            "consensus_cluster_size",
+            "consensus_cluster_internal_tanimoto",
+            "required_functional_groups",
+            "required_functional_group_probs",
+            "functional_group_constraint_triggered",
+            "functional_group_constraint_found",
+            "functional_group_constraint_regenerated",
+            "functional_group_constraint_final_satisfied",
+            "functional_group_constraint_beam_size",
+        ]
+        for rank in range(1, top_k + 1):
+            summary_headers.extend(
+                [
+                    f"top{rank}_smiles",
+                    f"top{rank}_beam_score",
+                    f"top{rank}_tanimoto_to_gt",
+                    f"top{rank}_avg_top10_tanimoto",
+                    f"top{rank}_in_consensus_cluster",
+                    f"top{rank}_fg_ok",
+                ]
+            )
+
+        import csv
+
+        with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow(summary_headers)
+            for item in failures:
+                row = [
+                    item["sample_index"],
+                    item["gt"],
+                    item["greedy_pred"],
+                    item["beam_top1_pred"],
+                    item["consensus_pred"],
+                    item["ir_rerank_pred"],
+                    item["consensus_cluster_size"],
+                    item["consensus_cluster_internal_tanimoto"],
+                    ",".join(item.get("required_functional_groups", [])),
+                    json.dumps(item.get("required_functional_group_probs", {}), ensure_ascii=False),
+                    item["functional_group_constraint_triggered"],
+                    item["functional_group_constraint_found"],
+                    item["functional_group_constraint_regenerated"],
+                    item["functional_group_constraint_final_satisfied"],
+                    item["functional_group_constraint_beam_size"],
+                ]
+                candidates = item.get("topk_candidates", [])
+                for rank in range(top_k):
+                    if rank < len(candidates):
+                        cand = candidates[rank]
+                        row.extend(
+                            [
+                                cand.get("smiles", ""),
+                                cand.get("beam_score", ""),
+                                cand.get("tanimoto_to_gt", ""),
+                                cand.get("avg_top10_tanimoto", ""),
+                                cand.get("in_consensus_cluster", False),
+                                cand.get("satisfies_required_functional_groups", True),
+                            ]
+                        )
+                    else:
+                        row.extend(["", "", "", "", "", ""])
+                writer.writerow(row)
+        return csv_path, f"openpyxl unavailable, exported CSV instead ({exc})"
+
+    workbook = Workbook()
+    summary_sheet = workbook.active
+    summary_sheet.title = "summary"
+    candidate_sheet = workbook.create_sheet(title="topk_candidates")
+
+    summary_headers = [
+        "sample_index",
+        "gt",
+        "greedy_pred",
+        "beam_top1_pred",
+        "consensus_pred",
+        "ir_rerank_pred",
+        "consensus_cluster_size",
+        "consensus_cluster_internal_tanimoto",
+        "required_functional_groups",
+        "required_functional_group_probs",
+        "functional_group_constraint_triggered",
+        "functional_group_constraint_found",
+        "functional_group_constraint_regenerated",
+        "functional_group_constraint_final_satisfied",
+        "functional_group_constraint_beam_size",
+    ]
+    for rank in range(1, top_k + 1):
+        summary_headers.extend(
+            [
+                f"top{rank}_smiles",
+                f"top{rank}_beam_score",
+                f"top{rank}_tanimoto_to_gt",
+                f"top{rank}_avg_top10_tanimoto",
+                f"top{rank}_in_consensus_cluster",
+                f"top{rank}_fg_ok",
+            ]
+        )
+    summary_sheet.append(summary_headers)
+
+    candidate_sheet.append(
+        [
+            "sample_index",
+            "gt",
+            "rank",
+            "smiles",
+            "beam_score",
+            "tanimoto_to_gt",
+            "avg_top10_tanimoto",
+            "in_consensus_cluster",
+            "satisfies_required_functional_groups",
+        ]
+    )
+
+    for item in failures:
+        row = [
+            item["sample_index"],
+            item["gt"],
+            item["greedy_pred"],
+            item["beam_top1_pred"],
+            item["consensus_pred"],
+            item["ir_rerank_pred"],
+            item["consensus_cluster_size"],
+            item["consensus_cluster_internal_tanimoto"],
+            ",".join(item.get("required_functional_groups", [])),
+            json.dumps(item.get("required_functional_group_probs", {}), ensure_ascii=False),
+            item["functional_group_constraint_triggered"],
+            item["functional_group_constraint_found"],
+            item["functional_group_constraint_regenerated"],
+            item["functional_group_constraint_final_satisfied"],
+            item["functional_group_constraint_beam_size"],
+        ]
+        candidates = item.get("topk_candidates", [])
+        for rank in range(top_k):
+            if rank < len(candidates):
+                cand = candidates[rank]
+                row.extend(
+                    [
+                        cand.get("smiles", ""),
+                        cand.get("beam_score", ""),
+                        cand.get("tanimoto_to_gt", ""),
+                        cand.get("avg_top10_tanimoto", ""),
+                        cand.get("in_consensus_cluster", False),
+                        cand.get("satisfies_required_functional_groups", True),
+                    ]
+                )
+                candidate_sheet.append(
+                    [
+                        item["sample_index"],
+                        item["gt"],
+                        cand.get("rank", rank + 1),
+                        cand.get("smiles", ""),
+                        cand.get("beam_score", ""),
+                        cand.get("tanimoto_to_gt", ""),
+                        cand.get("avg_top10_tanimoto", ""),
+                        cand.get("in_consensus_cluster", False),
+                        cand.get("satisfies_required_functional_groups", True),
+                    ]
+                )
+            else:
+                row.extend(["", "", "", "", "", ""])
+        summary_sheet.append(row)
+
+    workbook.save(output_path)
+    return output_path, "xlsx"
 
 
 def main() -> None:
@@ -1163,6 +1376,12 @@ def main() -> None:
     parser.add_argument("--functional-group-beam-multiplier", type=float, default=2.0)
     parser.add_argument("--functional-group-max-beam-size", type=int, default=40)
     parser.add_argument("--functional-group-max-regenerations", type=int, default=2)
+    parser.add_argument("--save-top10-failures", action="store_true")
+    parser.add_argument(
+        "--top10-failures-path",
+        type=str,
+        default="checkpoints/TransformerModel/top10_all_wrong.xlsx",
+    )
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -1212,7 +1431,7 @@ def main() -> None:
         topk=args.topk,
     )
 
-    em_rate, pairs, elem_metrics = evaluate_generation(
+    em_rate, pairs, elem_metrics, top10_failures = evaluate_generation(
         model=model,
         dataset=eval_dataset,
         id_to_token=id_to_token,
@@ -1247,6 +1466,15 @@ def main() -> None:
         functional_group_max_beam_size=args.functional_group_max_beam_size,
         functional_group_max_regenerations=args.functional_group_max_regenerations,
     )
+
+    exported_failure_path = None
+    exported_failure_note = None
+    if args.save_top10_failures:
+        exported_failure_path, exported_failure_note = export_topk_failures_to_excel(
+            failures=top10_failures,
+            output_path=args.top10_failures_path,
+            top_k=args.beam_display_top_k,
+        )
 
     print("=" * 70)
     print("Transformer model evaluation finished")
@@ -1291,6 +1519,8 @@ def main() -> None:
     print(f"Beam top-1 tanimoto    : {elem_metrics['beam_top1_tanimoto_mean']:.6f}")
     print(f"Beam top-{args.beam_size} exact  : {elem_metrics['beam_topk_exact_match_rate']:.4%}")
     print(f"Beam top-{args.beam_display_top_k} best tanimoto : {elem_metrics['beam_topk_best_tanimoto_mean']:.6f}")
+    print(f"Top-{args.beam_display_top_k} all-wrong rate : {elem_metrics['topk_all_wrong_rate']:.4%}")
+    print(f"Top-{args.beam_display_top_k} all-wrong count: {elem_metrics['topk_all_wrong_count']}")
     print(f"Consensus top-1 exact  : {elem_metrics['consensus_top1_exact_match_rate']:.4%}")
     print(f"Consensus tanimoto     : {elem_metrics['consensus_top1_tanimoto_mean']:.6f}")
     print(f"Consensus cluster size : {elem_metrics['consensus_cluster_size_mean']:.4f}")
@@ -1310,6 +1540,10 @@ def main() -> None:
     print(f"Element set match      : {elem_metrics['element_set_match_rate']:.4%}")
     print(f"Element count exact    : {elem_metrics['element_count_exact_match_rate']:.4%}")
     print(f"Element count MAE      : {elem_metrics['element_count_mae']:.6f}")
+    if exported_failure_path is not None:
+        print(f"Top-{args.beam_display_top_k} failures file : {exported_failure_path}")
+        if exported_failure_note not in {None, 'xlsx'}:
+            print(f"Top-{args.beam_display_top_k} failures note : {exported_failure_note}")
     print("=" * 70)
 
     show_n = min(args.print_samples, len(pairs))
