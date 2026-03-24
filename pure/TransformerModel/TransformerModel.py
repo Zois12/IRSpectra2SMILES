@@ -60,10 +60,10 @@ class ResidualBlock1D(nn.Module):
         return out
 
 
-class MultiScaleResNet1D(nn.Module):
+class ResidualPatchCNN1D(nn.Module):
     """
-    ResNet backbone with multi-scale fusion for 1D IR spectra.
-    Returns feature map [B, d_model, S].
+    Lightweight residual CNN followed by explicit non-overlapping patching.
+    Returns patched feature map [B, d_model, S].
     """
 
     def __init__(
@@ -72,68 +72,49 @@ class MultiScaleResNet1D(nn.Module):
         dropout: float = 0.1,
         multiscale_target: str = "mid",
         use_coordconv: bool = False,
+        patch_size: int = 4,
     ):
         super().__init__()
-        self.multiscale_target = multiscale_target
+        del multiscale_target  # kept for backward-compatible constructor signature
         self.use_coordconv = bool(use_coordconv)
+        self.patch_size = max(int(patch_size), 1)
 
         in_channels = 2 if self.use_coordconv else 1
         self.stem = nn.Sequential(
-            nn.Conv1d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False),
+            nn.Conv1d(in_channels, 64, kernel_size=7, stride=1, padding=3, bias=False),
             nn.BatchNorm1d(64),
             nn.GELU(),
         )
 
-        self.stage1 = nn.Sequential(
+        self.blocks = nn.Sequential(
+            ResidualBlock1D(64, 64, stride=1, dropout=dropout),
             ResidualBlock1D(64, 128, stride=2, dropout=dropout),
-            ResidualBlock1D(128, 128, stride=1, dropout=dropout),
+            ResidualBlock1D(128, 128, stride=1, dropout=dropout, dilation=2),
+            ResidualBlock1D(128, d_model, stride=2, dropout=dropout, dilation=2),
         )
-        self.stage2 = nn.Sequential(
-            ResidualBlock1D(128, 256, stride=2, dropout=dropout),
-            ResidualBlock1D(256, 256, stride=1, dropout=dropout),
-        )
-        self.stage3 = nn.Sequential(
-            ResidualBlock1D(256, d_model, stride=2, dropout=dropout, dilation=2),
-            ResidualBlock1D(d_model, d_model, stride=1, dropout=dropout, dilation=2),
-        )
-
-        self.proj_s1 = nn.Conv1d(128, d_model, kernel_size=1, bias=False)
-        self.proj_s2 = nn.Conv1d(256, d_model, kernel_size=1, bias=False)
-        self.proj_s3 = nn.Conv1d(d_model, d_model, kernel_size=1, bias=False)
-        self.fuse = nn.Sequential(
-            nn.Conv1d(d_model * 3, d_model, kernel_size=1, bias=False),
+        self.patch_proj = nn.Sequential(
+            nn.Conv1d(
+                d_model,
+                d_model,
+                kernel_size=self.patch_size,
+                stride=self.patch_size,
+                bias=False,
+            ),
             nn.BatchNorm1d(d_model),
             nn.GELU(),
         )
 
-    def _resize(self, x: torch.Tensor, target_len: int) -> torch.Tensor:
-        if x.size(-1) == target_len:
-            return x
-        return F.interpolate(x, size=target_len, mode="linear", align_corners=False)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, 1, L]
         if self.use_coordconv:
-            coord = torch.linspace(-1.0, 1.0, x.size(-1), device=x.device)
+            coord = torch.linspace(-1.0, 1.0, x.size(-1), device=x.device, dtype=x.dtype)
             coord = coord.unsqueeze(0).unsqueeze(0).expand(x.size(0), 1, -1)
             x = torch.cat([x, coord], dim=1)
         x = self.stem(x)
-        s1 = self.stage1(x)  # high resolution branch
-        s2 = self.stage2(s1)  # medium resolution branch
-        s3 = self.stage3(s2)  # low resolution branch
-
-        if self.multiscale_target == "high":
-            target_len = s1.size(-1)
-        elif self.multiscale_target == "low":
-            target_len = s3.size(-1)
-        else:
-            target_len = s2.size(-1)
-
-        f1 = self._resize(self.proj_s1(s1), target_len)
-        f2 = self._resize(self.proj_s2(s2), target_len)
-        f3 = self._resize(self.proj_s3(s3), target_len)
-        fused = self.fuse(torch.cat([f1, f2, f3], dim=1))
-        return fused
+        x = self.blocks(x)
+        if x.size(-1) < self.patch_size:
+            x = F.pad(x, (0, self.patch_size - x.size(-1)))
+        x = self.patch_proj(x)
+        return x
 
 
 class ConvFeatureEncoder(nn.Module):
@@ -153,18 +134,21 @@ class ConvFeatureEncoder(nn.Module):
         dropout: float = 0.1,
         multiscale_target: str = "mid",
         use_coordconv: bool = False,
+        patch_size: int = 4,
     ):
         super().__init__()
         self.d_model = d_model
         self.max_memory_len = max_memory_len
         self.input_points = input_points
         self.buffer_layers = int(buffer_layers)
+        self.patch_size = max(int(patch_size), 1)
 
-        self.cnn = MultiScaleResNet1D(
+        self.cnn = ResidualPatchCNN1D(
             d_model=d_model,
             dropout=dropout,
             multiscale_target=multiscale_target,
             use_coordconv=use_coordconv,
+            patch_size=self.patch_size,
         )
         self.formula_proj = nn.Sequential(
             nn.Linear(formula_dim, d_model),
@@ -359,6 +343,7 @@ class IRFormulaTransformer(nn.Module):
         encoder_buffer_dim_feedforward: Optional[int] = None,
         encoder_multiscale_target: str = "mid",
         encoder_use_coordconv: bool = False,
+        encoder_patch_size: int = 4,
         num_functional_groups: int = 0,
         use_functional_group_head: bool = False,
         use_functional_group_token: bool = False,
@@ -390,6 +375,7 @@ class IRFormulaTransformer(nn.Module):
             dropout=dropout,
             multiscale_target=encoder_multiscale_target,
             use_coordconv=encoder_use_coordconv,
+            patch_size=encoder_patch_size,
         )
         fg_dropout = dropout if functional_group_dropout is None else float(functional_group_dropout)
         self.spectral_pool = None

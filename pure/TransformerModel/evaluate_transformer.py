@@ -126,6 +126,7 @@ def build_model(model_path: str, config: Dict, device: torch.device) -> IRFormul
         encoder_buffer_dim_feedforward=config.get("encoder_buffer_dim_feedforward", config["dim_feedforward"]),
         encoder_multiscale_target=config.get("encoder_multiscale_target", "mid"),
         encoder_use_coordconv=config.get("encoder_use_coordconv", False),
+        encoder_patch_size=config.get("encoder_patch_size", 4),
         num_functional_groups=config.get("num_functional_groups", 0),
         use_functional_group_head=config.get("use_functional_group_aux", False),
         use_functional_group_token=config.get("use_functional_group_aux", False)

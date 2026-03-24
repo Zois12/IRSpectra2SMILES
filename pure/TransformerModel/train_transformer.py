@@ -46,10 +46,11 @@ DIM_FEEDFORWARD = 2048
 DROPOUT = 0.1
 MAX_TGT_LEN = 256
 MAX_MEMORY_LEN = 1024
-ENCODER_BUFFER_LAYERS = 2
+ENCODER_BUFFER_LAYERS = 6
 ENCODER_BUFFER_DIM_FEEDFORWARD = 2048
 ENCODER_MULTISCALE_TARGET = "mid"
-ENCODER_USE_COORDCONV = True
+ENCODER_USE_COORDCONV = False
+ENCODER_PATCH_SIZE = 4
 VAL_SEQ_EM_MAX_SAMPLES = 300
 VAL_SEQ_EM_MAX_LEN = 120
 VAL_SEQ_EM_EVERY = 2
@@ -103,6 +104,11 @@ USE_FUNCTIONAL_GROUP_FUSION = True
 FUNCTIONAL_GROUP_DETACH_FUSION = False
 FUNCTIONAL_GROUP_HEAD_DIM = 256
 FUNCTIONAL_GROUP_THRESHOLD = 0.5
+USE_TEACHER_FORCING_DECAY = True
+TEACHER_FORCING_START = 1.0
+TEACHER_FORCING_END = 0.7
+TEACHER_FORCING_WARMUP_EPOCHS = 5
+TEACHER_FORCING_DECAY_EPOCHS = 20
 
 
 def get_tokenizer():
@@ -203,6 +209,43 @@ def multilabel_batch_f1(probs: torch.Tensor, targets: torch.Tensor, threshold: f
     if precision + recall <= eps:
         return 0.0
     return float(2.0 * precision * recall / (precision + recall))
+
+
+def get_teacher_forcing_ratio(epoch_idx: int) -> float:
+    if not USE_TEACHER_FORCING_DECAY:
+        return 1.0
+    if epoch_idx < TEACHER_FORCING_WARMUP_EPOCHS:
+        return float(TEACHER_FORCING_START)
+    decay_progress = epoch_idx - TEACHER_FORCING_WARMUP_EPOCHS
+    if TEACHER_FORCING_DECAY_EPOCHS <= 0:
+        return float(TEACHER_FORCING_END)
+    mix = min(max(decay_progress / TEACHER_FORCING_DECAY_EPOCHS, 0.0), 1.0)
+    ratio = TEACHER_FORCING_START + (TEACHER_FORCING_END - TEACHER_FORCING_START) * mix
+    return float(max(min(ratio, 1.0), 0.0))
+
+
+def apply_teacher_forcing_decay(
+    model: IRFormulaTransformer,
+    encoder_input_spectra: torch.Tensor,
+    formula_vec: torch.Tensor,
+    decoder_input: torch.Tensor,
+    teacher_forcing_ratio: float,
+    pad_id: int,
+) -> torch.Tensor:
+    if teacher_forcing_ratio >= 1.0 or decoder_input.size(1) <= 1:
+        return decoder_input
+
+    with torch.no_grad():
+        preview_outputs = model(encoder_input_spectra, formula_vec, decoder_input, return_aux=True)
+        preview_logits = preview_outputs["logits"]
+        preview_pred = preview_logits.argmax(dim=-1)
+
+    mixed_input = decoder_input.clone()
+    sampled_prev_tokens = preview_pred[:, :-1]
+    replace_mask = torch.rand_like(decoder_input[:, 1:].float()).gt(teacher_forcing_ratio)
+    replace_mask = replace_mask & decoder_input[:, 1:].ne(pad_id)
+    mixed_input[:, 1:] = torch.where(replace_mask, sampled_prev_tokens, mixed_input[:, 1:])
+    return mixed_input
 
 
 def soft_token_tanimoto_loss(
@@ -496,6 +539,7 @@ def train_model():
                     "encoder_buffer_dim_feedforward": ENCODER_BUFFER_DIM_FEEDFORWARD,
                     "encoder_multiscale_target": ENCODER_MULTISCALE_TARGET,
                     "encoder_use_coordconv": ENCODER_USE_COORDCONV,
+                    "encoder_patch_size": ENCODER_PATCH_SIZE,
                     "label_smoothing": LABEL_SMOOTHING,
                     "use_tanimoto_aux_loss": USE_TANIMOTO_AUX_LOSS,
                     "tanimoto_loss_weight": TANIMOTO_LOSS_WEIGHT,
@@ -522,6 +566,11 @@ def train_model():
                     "functional_group_head_dim": FUNCTIONAL_GROUP_HEAD_DIM,
                     "functional_group_threshold": FUNCTIONAL_GROUP_THRESHOLD,
                     "num_functional_groups": len(FUNCTIONAL_GROUP_LABEL_NAMES),
+                    "use_teacher_forcing_decay": USE_TEACHER_FORCING_DECAY,
+                    "teacher_forcing_start": TEACHER_FORCING_START,
+                    "teacher_forcing_end": TEACHER_FORCING_END,
+                    "teacher_forcing_warmup_epochs": TEACHER_FORCING_WARMUP_EPOCHS,
+                    "teacher_forcing_decay_epochs": TEACHER_FORCING_DECAY_EPOCHS,
                 },
             )
         except Exception as exc:
@@ -613,6 +662,7 @@ def train_model():
         encoder_buffer_dim_feedforward=ENCODER_BUFFER_DIM_FEEDFORWARD,
         encoder_multiscale_target=ENCODER_MULTISCALE_TARGET,
         encoder_use_coordconv=ENCODER_USE_COORDCONV,
+        encoder_patch_size=ENCODER_PATCH_SIZE,
         num_functional_groups=len(FUNCTIONAL_GROUP_LABEL_NAMES) if USE_FUNCTIONAL_GROUP_AUX else 0,
         use_functional_group_head=USE_FUNCTIONAL_GROUP_AUX,
         use_functional_group_token=USE_FUNCTIONAL_GROUP_AUX and USE_FUNCTIONAL_GROUP_FUSION,
@@ -683,6 +733,7 @@ def train_model():
                 "encoder_buffer_dim_feedforward": ENCODER_BUFFER_DIM_FEEDFORWARD,
                 "encoder_multiscale_target": ENCODER_MULTISCALE_TARGET,
                 "encoder_use_coordconv": ENCODER_USE_COORDCONV,
+                "encoder_patch_size": ENCODER_PATCH_SIZE,
                 "pad_id": pad_id,
                 "sos_id": sos_id,
                 "eos_id": eos_id,
@@ -731,6 +782,11 @@ def train_model():
                 "functional_group_head_dim": FUNCTIONAL_GROUP_HEAD_DIM,
                 "functional_group_threshold": FUNCTIONAL_GROUP_THRESHOLD,
                 "functional_group_cache_path": FUNCTIONAL_GROUP_CACHE_PATH if USE_FUNCTIONAL_GROUP_AUX else None,
+                "use_teacher_forcing_decay": USE_TEACHER_FORCING_DECAY,
+                "teacher_forcing_start": TEACHER_FORCING_START,
+                "teacher_forcing_end": TEACHER_FORCING_END,
+                "teacher_forcing_warmup_epochs": TEACHER_FORCING_WARMUP_EPOCHS,
+                "teacher_forcing_decay_epochs": TEACHER_FORCING_DECAY_EPOCHS,
             },
             f,
             ensure_ascii=True,
@@ -747,6 +803,7 @@ def train_model():
         model.train()
         if masked_patch_head is not None:
             masked_patch_head.train()
+        teacher_forcing_ratio = get_teacher_forcing_ratio(epoch)
         total_loss = 0.0
         total_ce_loss = 0.0
         total_tanimoto_aux_loss = 0.0
@@ -793,6 +850,14 @@ def train_model():
             optimizer.zero_grad()
             decoder_input = smiles_ids[:, :-1]
             target = smiles_ids[:, 1:]
+            decoder_input = apply_teacher_forcing_decay(
+                model=model,
+                encoder_input_spectra=encoder_input_spectra,
+                formula_vec=formula_vec,
+                decoder_input=decoder_input,
+                teacher_forcing_ratio=teacher_forcing_ratio,
+                pad_id=pad_id,
+            )
             if USE_MASKED_PATCH_AUX and masked_patch_head is not None:
                 outputs = model(encoder_input_spectra, formula_vec, decoder_input, return_aux=True)
                 memory = outputs["memory"]
@@ -896,6 +961,7 @@ def train_model():
                 train_pbar.set_postfix(
                     loss=f"{loss.item():.4f}",
                     ce=f"{ce_loss.item():.4f}",
+                    tf=f"{teacher_forcing_ratio:.2f}",
                     tan=f"{soft_tanimoto.item():.4f}",
                     fg=f"{fg_loss.item():.4f}",
                     mpatch=f"{masked_patch_loss.item():.4f}",
@@ -904,6 +970,7 @@ def train_model():
                 train_pbar.set_postfix(
                     loss=f"{loss.item():.4f}",
                     ce=f"{ce_loss.item():.4f}",
+                    tf=f"{teacher_forcing_ratio:.2f}",
                     tan=f"{soft_tanimoto.item():.4f}",
                     fg=f"{fg_loss.item():.4f}",
                     mpatch=f"{masked_patch_loss.item():.4f}",
@@ -953,6 +1020,7 @@ def train_model():
         tqdm.write(
             f"Epoch {epoch + 1}/{TRAIN_EPOCH} | "
             f"lr={lr_now:.2e} "
+            f"tf={teacher_forcing_ratio:.2f} "
             f"train_loss={train_loss:.4f} train_ce={train_ce_loss:.4f} "
             f"train_tan_loss={train_tanimoto_aux_loss:.4f} train_tan={train_soft_tanimoto:.4f} "
             f"train_fg_loss={train_fg_loss:.4f} train_fg_f1={train_fg_f1:.4f} "
@@ -969,6 +1037,7 @@ def train_model():
                 {
                     "epoch": epoch + 1,
                     "lr": lr_now,
+                    "teacher_forcing_ratio": teacher_forcing_ratio,
                     "train_loss": train_loss,
                     "train_ce_loss": train_ce_loss,
                     "train_tanimoto_aux_loss": train_tanimoto_aux_loss,
