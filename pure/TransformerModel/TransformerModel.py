@@ -1,9 +1,228 @@
+import copy
 import math
 from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+class TransformerFeedForward(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        dim_feedforward: int,
+        dropout: float = 0.1,
+        ffn_type: str = "gelu",
+    ):
+        super().__init__()
+        self.ffn_type = str(ffn_type).lower()
+        if self.ffn_type not in {"gelu", "glu"}:
+            raise ValueError(f"Unsupported transformer FFN type: {ffn_type}")
+
+        hidden_in = dim_feedforward * 2 if self.ffn_type == "glu" else dim_feedforward
+        self.linear1 = nn.Linear(d_model, hidden_in)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.linear1(x)
+        if self.ffn_type == "glu":
+            x = F.glu(x, dim=-1)
+        else:
+            x = F.gelu(x)
+        x = self.dropout(x)
+        x = self.linear2(x)
+        return x
+
+
+class GLUTransformerEncoderLayer(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        dim_feedforward: int = 2048,
+        dropout: float = 0.1,
+        norm_first: bool = True,
+        ffn_type: str = "glu",
+    ):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(
+            d_model,
+            nhead,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.ffn = TransformerFeedForward(
+            d_model=d_model,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            ffn_type=ffn_type,
+        )
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.norm_first = norm_first
+
+    def _self_attention_block(
+        self,
+        x: torch.Tensor,
+        src_mask: Optional[torch.Tensor],
+        src_key_padding_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        x, _ = self.self_attn(
+            x,
+            x,
+            x,
+            attn_mask=src_mask,
+            key_padding_mask=src_key_padding_mask,
+            need_weights=False,
+        )
+        return x
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        src_mask: Optional[torch.Tensor] = None,
+        src_key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if self.norm_first:
+            x = x + self.dropout1(self._self_attention_block(self.norm1(x), src_mask, src_key_padding_mask))
+            x = x + self.dropout2(self.ffn(self.norm2(x)))
+        else:
+            x = self.norm1(x + self.dropout1(self._self_attention_block(x, src_mask, src_key_padding_mask)))
+            x = self.norm2(x + self.dropout2(self.ffn(x)))
+        return x
+
+
+class GLUTransformerEncoder(nn.Module):
+    def __init__(self, encoder_layer: GLUTransformerEncoderLayer, num_layers: int):
+        super().__init__()
+        self.layers = nn.ModuleList(copy.deepcopy(encoder_layer) for _ in range(num_layers))
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        src_key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        for layer in self.layers:
+            x = layer(x, src_mask=mask, src_key_padding_mask=src_key_padding_mask)
+        return x
+
+
+class GLUTransformerDecoderLayer(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        dim_feedforward: int = 2048,
+        dropout: float = 0.1,
+        norm_first: bool = False,
+        ffn_type: str = "glu",
+    ):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(
+            d_model,
+            nhead,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.cross_attn = nn.MultiheadAttention(
+            d_model,
+            nhead,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.ffn = TransformerFeedForward(
+            d_model=d_model,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            ffn_type=ffn_type,
+        )
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+        self.norm_first = norm_first
+
+    def _self_attention_block(
+        self,
+        x: torch.Tensor,
+        tgt_mask: Optional[torch.Tensor],
+        tgt_key_padding_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        x, _ = self.self_attn(
+            x,
+            x,
+            x,
+            attn_mask=tgt_mask,
+            key_padding_mask=tgt_key_padding_mask,
+            need_weights=False,
+        )
+        return x
+
+    def _cross_attention_block(
+        self,
+        x: torch.Tensor,
+        memory: torch.Tensor,
+        memory_key_padding_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        x, _ = self.cross_attn(
+            x,
+            memory,
+            memory,
+            key_padding_mask=memory_key_padding_mask,
+            need_weights=False,
+        )
+        return x
+
+    def forward(
+        self,
+        tgt: torch.Tensor,
+        memory: torch.Tensor,
+        tgt_mask: Optional[torch.Tensor] = None,
+        tgt_key_padding_mask: Optional[torch.Tensor] = None,
+        memory_key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if self.norm_first:
+            tgt = tgt + self.dropout1(self._self_attention_block(self.norm1(tgt), tgt_mask, tgt_key_padding_mask))
+            tgt = tgt + self.dropout2(self._cross_attention_block(self.norm2(tgt), memory, memory_key_padding_mask))
+            tgt = tgt + self.dropout3(self.ffn(self.norm3(tgt)))
+        else:
+            tgt = self.norm1(tgt + self.dropout1(self._self_attention_block(tgt, tgt_mask, tgt_key_padding_mask)))
+            tgt = self.norm2(
+                tgt + self.dropout2(self._cross_attention_block(tgt, memory, memory_key_padding_mask))
+            )
+            tgt = self.norm3(tgt + self.dropout3(self.ffn(tgt)))
+        return tgt
+
+
+class GLUTransformerDecoder(nn.Module):
+    def __init__(self, decoder_layer: GLUTransformerDecoderLayer, num_layers: int):
+        super().__init__()
+        self.layers = nn.ModuleList(copy.deepcopy(decoder_layer) for _ in range(num_layers))
+
+    def forward(
+        self,
+        tgt: torch.Tensor,
+        memory: torch.Tensor,
+        tgt_mask: Optional[torch.Tensor] = None,
+        tgt_key_padding_mask: Optional[torch.Tensor] = None,
+        memory_key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        for layer in self.layers:
+            tgt = layer(
+                tgt,
+                memory,
+                tgt_mask=tgt_mask,
+                tgt_key_padding_mask=tgt_key_padding_mask,
+                memory_key_padding_mask=memory_key_padding_mask,
+            )
+        return tgt
 
 
 class ResidualBlock1D(nn.Module):
@@ -119,7 +338,7 @@ class ResidualPatchCNN1D(nn.Module):
 
 class ConvFeatureEncoder(nn.Module):
     """
-    Encode IR spectrum + molecular formula into a memory sequence for Transformer decoder.
+    Encode IR spectrum + optional molecular formula into a memory sequence.
     """
 
     def __init__(
@@ -135,6 +354,8 @@ class ConvFeatureEncoder(nn.Module):
         multiscale_target: str = "mid",
         use_coordconv: bool = False,
         patch_size: int = 4,
+        transformer_ffn_type: str = "gelu",
+        use_formula_input: bool = True,
     ):
         super().__init__()
         self.d_model = d_model
@@ -142,6 +363,8 @@ class ConvFeatureEncoder(nn.Module):
         self.input_points = input_points
         self.buffer_layers = int(buffer_layers)
         self.patch_size = max(int(patch_size), 1)
+        self.transformer_ffn_type = str(transformer_ffn_type).lower()
+        self.use_formula_input = bool(use_formula_input)
 
         self.cnn = ResidualPatchCNN1D(
             d_model=d_model,
@@ -150,27 +373,41 @@ class ConvFeatureEncoder(nn.Module):
             use_coordconv=use_coordconv,
             patch_size=self.patch_size,
         )
-        self.formula_proj = nn.Sequential(
-            nn.Linear(formula_dim, d_model),
-            nn.GELU(),
-            nn.Linear(d_model, d_model),
-        )
+        if self.use_formula_input:
+            self.formula_proj = nn.Sequential(
+                nn.Linear(formula_dim, d_model),
+                nn.GELU(),
+                nn.Linear(d_model, d_model),
+            )
+        else:
+            self.formula_proj = None
 
         self.memory_pos_emb = nn.Embedding(max_memory_len, d_model)
         self.dropout = nn.Dropout(dropout)
         self.norm = nn.LayerNorm(d_model)
 
         if self.buffer_layers > 0:
-            encoder_layer = nn.TransformerEncoderLayer(
-                d_model=d_model,
-                nhead=nhead,
-                dim_feedforward=buffer_dim_feedforward,
-                dropout=dropout,
-                activation="gelu",
-                batch_first=True,
-                norm_first=True,
-            )
-            self.buffer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=self.buffer_layers)
+            if self.transformer_ffn_type == "glu":
+                encoder_layer = GLUTransformerEncoderLayer(
+                    d_model=d_model,
+                    nhead=nhead,
+                    dim_feedforward=buffer_dim_feedforward,
+                    dropout=dropout,
+                    norm_first=True,
+                    ffn_type=self.transformer_ffn_type,
+                )
+                self.buffer_encoder = GLUTransformerEncoder(encoder_layer, num_layers=self.buffer_layers)
+            else:
+                encoder_layer = nn.TransformerEncoderLayer(
+                    d_model=d_model,
+                    nhead=nhead,
+                    dim_feedforward=buffer_dim_feedforward,
+                    dropout=dropout,
+                    activation="gelu",
+                    batch_first=True,
+                    norm_first=True,
+                )
+                self.buffer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=self.buffer_layers)
             self.buffer_norm = nn.LayerNorm(d_model)
         else:
             self.buffer_encoder = None
@@ -183,17 +420,24 @@ class ConvFeatureEncoder(nn.Module):
         return feat.transpose(1, 2)  # [B, S, d_model]
 
     def project_formula(self, formula_vec: torch.Tensor) -> torch.Tensor:
+        if not self.use_formula_input or self.formula_proj is None:
+            raise RuntimeError("Formula projection requested while use_formula_input=False.")
         return self.formula_proj(formula_vec).unsqueeze(1)  # [B, 1, d_model]
 
     def build_memory(
         self,
         spectral_tokens: torch.Tensor,
-        formula_vec: torch.Tensor,
+        formula_vec: Optional[torch.Tensor],
         extra_tokens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        formula_token = self.project_formula(formula_vec)
-        tokens = [formula_token]
-        prefix_len = 1
+        tokens = []
+        prefix_len = 0
+        if self.use_formula_input:
+            if formula_vec is None:
+                raise ValueError("formula_vec must be provided when use_formula_input=True")
+            formula_token = self.project_formula(formula_vec)
+            tokens.append(formula_token)
+            prefix_len = 1
         if extra_tokens is not None:
             if extra_tokens.dim() != 3 or extra_tokens.size(0) != spectral_tokens.size(0) or extra_tokens.size(2) != self.d_model:
                 raise ValueError(
@@ -224,40 +468,11 @@ class ConvFeatureEncoder(nn.Module):
     def forward(
         self,
         ir_spectrum: torch.Tensor,
-        formula_vec: torch.Tensor,
+        formula_vec: Optional[torch.Tensor],
         extra_tokens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         spectral_tokens = self.encode_spectrum(ir_spectrum)
         return self.build_memory(spectral_tokens, formula_vec, extra_tokens=extra_tokens)
-
-
-class SpectralTokenPooling(nn.Module):
-    def __init__(self, d_model: int):
-        super().__init__()
-        self.norm = nn.LayerNorm(d_model * 2)
-
-    def forward(self, spectral_tokens: torch.Tensor) -> torch.Tensor:
-        if spectral_tokens.dim() != 3:
-            raise ValueError(f"Expected spectral_tokens [B, S, D], got {tuple(spectral_tokens.shape)}")
-        mean_pool = spectral_tokens.mean(dim=1)
-        max_pool = spectral_tokens.max(dim=1).values
-        return self.norm(torch.cat([mean_pool, max_pool], dim=-1))
-
-
-class FunctionalGroupHead(nn.Module):
-    def __init__(self, input_dim: int, num_labels: int, hidden_dim: int = 256, dropout: float = 0.1):
-        super().__init__()
-        hidden_dim = max(int(hidden_dim), 64)
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, num_labels),
-        )
-
-    def forward(self, pooled_features: torch.Tensor) -> torch.Tensor:
-        return self.net(pooled_features)
-
 
 class TransformerSMILESDecoder(nn.Module):
     def __init__(
@@ -270,24 +485,39 @@ class TransformerSMILESDecoder(nn.Module):
         dropout: float = 0.1,
         max_tgt_len: int = 256,
         pad_id: int = 0,
+        transformer_ffn_type: str = "gelu",
     ):
         super().__init__()
         self.d_model = d_model
         self.pad_id = pad_id
         self.max_tgt_len = max_tgt_len
+        self.transformer_ffn_type = str(transformer_ffn_type).lower()
 
         self.token_emb = nn.Embedding(vocab_size, d_model)
         self.tgt_pos_emb = nn.Embedding(max_tgt_len, d_model)
 
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=False,
-        )
-        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
+        if self.transformer_ffn_type == "glu":
+            decoder_layer = GLUTransformerDecoderLayer(
+                d_model=d_model,
+                nhead=nhead,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+                norm_first=False,
+                ffn_type=self.transformer_ffn_type,
+            )
+            self.decoder = GLUTransformerDecoder(decoder_layer, num_layers=num_layers)
+            self.decoder_batch_first = True
+        else:
+            decoder_layer = nn.TransformerDecoderLayer(
+                d_model=d_model,
+                nhead=nhead,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+                activation="gelu",
+                batch_first=False,
+            )
+            self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
+            self.decoder_batch_first = False
         self.dropout = nn.Dropout(dropout)
         self.norm = nn.LayerNorm(d_model)
         self.fc_out = nn.Linear(d_model, vocab_size)
@@ -310,18 +540,24 @@ class TransformerSMILESDecoder(nn.Module):
         tgt_mask = self._causal_mask(tgt_len, tgt_ids.device)
         tgt_key_padding_mask = tgt_ids.eq(self.pad_id)
 
-        # transformer decoder expects [T, B, D]
-        tgt = tgt_emb.transpose(0, 1)
-        mem = memory.transpose(0, 1)
-
-        decoded = self.decoder(
-            tgt=tgt,
-            memory=mem,
-            tgt_mask=tgt_mask,
-            tgt_key_padding_mask=tgt_key_padding_mask,
-        )
-
-        decoded = decoded.transpose(0, 1)  # [B, T, D]
+        if self.decoder_batch_first:
+            decoded = self.decoder(
+                tgt=tgt_emb,
+                memory=memory,
+                tgt_mask=tgt_mask,
+                tgt_key_padding_mask=tgt_key_padding_mask,
+            )
+        else:
+            # transformer decoder expects [T, B, D]
+            tgt = tgt_emb.transpose(0, 1)
+            mem = memory.transpose(0, 1)
+            decoded = self.decoder(
+                tgt=tgt,
+                memory=mem,
+                tgt_mask=tgt_mask,
+                tgt_key_padding_mask=tgt_key_padding_mask,
+            )
+            decoded = decoded.transpose(0, 1)  # [B, T, D]
         logits = self.fc_out(decoded)  # [B, T, V]
         return logits
 
@@ -344,6 +580,8 @@ class IRFormulaTransformer(nn.Module):
         encoder_multiscale_target: str = "mid",
         encoder_use_coordconv: bool = False,
         encoder_patch_size: int = 4,
+        transformer_ffn_type: str = "gelu",
+        use_formula_input: bool = True,
         num_functional_groups: int = 0,
         use_functional_group_head: bool = False,
         use_functional_group_token: bool = False,
@@ -355,13 +593,19 @@ class IRFormulaTransformer(nn.Module):
         eos_id: int = 2,
     ):
         super().__init__()
+        del (
+            num_functional_groups,
+            use_functional_group_head,
+            use_functional_group_token,
+            functional_group_head_dim,
+            functional_group_dropout,
+            functional_group_detach_fusion,
+        )
         self.pad_id = pad_id
         self.sos_id = sos_id
         self.eos_id = eos_id
-        self.num_functional_groups = int(num_functional_groups)
-        self.use_functional_group_head = bool(use_functional_group_head)
-        self.use_functional_group_token = bool(use_functional_group_token)
-        self.functional_group_detach_fusion = bool(functional_group_detach_fusion)
+        self.use_formula_input = bool(use_formula_input)
+        self.transformer_ffn_type = str(transformer_ffn_type).lower()
 
         buffer_ffn = dim_feedforward if encoder_buffer_dim_feedforward is None else int(encoder_buffer_dim_feedforward)
         self.encoder = ConvFeatureEncoder(
@@ -376,29 +620,9 @@ class IRFormulaTransformer(nn.Module):
             multiscale_target=encoder_multiscale_target,
             use_coordconv=encoder_use_coordconv,
             patch_size=encoder_patch_size,
+            transformer_ffn_type=self.transformer_ffn_type,
+            use_formula_input=self.use_formula_input,
         )
-        fg_dropout = dropout if functional_group_dropout is None else float(functional_group_dropout)
-        self.spectral_pool = None
-        self.functional_group_head = None
-        self.functional_group_token_proj = None
-        if self.use_functional_group_head:
-            if self.num_functional_groups <= 0:
-                raise ValueError("num_functional_groups must be > 0 when use_functional_group_head=True")
-            self.spectral_pool = SpectralTokenPooling(d_model)
-            self.functional_group_head = FunctionalGroupHead(
-                input_dim=d_model * 2,
-                num_labels=self.num_functional_groups,
-                hidden_dim=functional_group_head_dim,
-                dropout=fg_dropout,
-            )
-            if self.use_functional_group_token:
-                self.functional_group_token_proj = nn.Sequential(
-                    nn.Linear(self.num_functional_groups, d_model),
-                    nn.GELU(),
-                    nn.LayerNorm(d_model),
-                )
-        elif self.use_functional_group_token:
-            raise ValueError("use_functional_group_token=True requires use_functional_group_head=True")
         self.decoder = TransformerSMILESDecoder(
             vocab_size=vocab_size,
             d_model=d_model,
@@ -408,46 +632,28 @@ class IRFormulaTransformer(nn.Module):
             dropout=dropout,
             max_tgt_len=max_tgt_len,
             pad_id=pad_id,
+            transformer_ffn_type=self.transformer_ffn_type,
         )
 
-    def _encode_with_functional_groups(
+    def _encode_memory(
         self,
         ir_spectrum: torch.Tensor,
-        formula_vec: torch.Tensor,
-    ):
-        spectral_tokens = self.encoder.encode_spectrum(ir_spectrum)
-        functional_group_logits = None
-        functional_group_probs = None
-        extra_tokens = None
-
-        if self.functional_group_head is not None and self.spectral_pool is not None:
-            pooled = self.spectral_pool(spectral_tokens)
-            functional_group_logits = self.functional_group_head(pooled)
-            functional_group_probs = torch.sigmoid(functional_group_logits)
-            if self.functional_group_token_proj is not None:
-                fusion_input = functional_group_probs.detach() if self.functional_group_detach_fusion else functional_group_probs
-                extra_tokens = self.functional_group_token_proj(fusion_input).unsqueeze(1)
-
-        memory = self.encoder.build_memory(spectral_tokens, formula_vec, extra_tokens=extra_tokens)
-        return memory, functional_group_logits, functional_group_probs
+        formula_vec: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        return self.encoder(ir_spectrum, formula_vec)
 
     def forward(
         self,
         ir_spectrum: torch.Tensor,
-        formula_vec: torch.Tensor,
+        formula_vec: Optional[torch.Tensor],
         target_smiles: torch.Tensor,
         return_aux: bool = False,
     ):
-        memory, functional_group_logits, functional_group_probs = self._encode_with_functional_groups(
-            ir_spectrum,
-            formula_vec,
-        )
+        memory = self._encode_memory(ir_spectrum, formula_vec)
         logits = self.decoder(memory, target_smiles)
         if return_aux:
             return {
                 "logits": logits,
-                "functional_group_logits": functional_group_logits,
-                "functional_group_probs": functional_group_probs,
                 "memory": memory,
             }
         return logits
@@ -456,7 +662,7 @@ class IRFormulaTransformer(nn.Module):
     def generate(
         self,
         ir_spectrum: torch.Tensor,
-        formula_vec: torch.Tensor,
+        formula_vec: Optional[torch.Tensor],
         max_len: int = 120,
         sos_id: Optional[int] = None,
         eos_id: Optional[int] = None,
@@ -466,7 +672,7 @@ class IRFormulaTransformer(nn.Module):
         eos_id = self.eos_id if eos_id is None else eos_id
 
         bsz = ir_spectrum.size(0)
-        memory, _, _ = self._encode_with_functional_groups(ir_spectrum, formula_vec)
+        memory = self._encode_memory(ir_spectrum, formula_vec)
 
         generated = torch.full((bsz, 1), sos_id, dtype=torch.long, device=ir_spectrum.device)
         finished = torch.zeros(bsz, dtype=torch.bool, device=ir_spectrum.device)
@@ -480,12 +686,3 @@ class IRFormulaTransformer(nn.Module):
                 break
 
         return generated
-
-    @torch.no_grad()
-    def predict_functional_groups(
-        self,
-        ir_spectrum: torch.Tensor,
-        formula_vec: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
-        _, _, functional_group_probs = self._encode_with_functional_groups(ir_spectrum, formula_vec)
-        return functional_group_probs

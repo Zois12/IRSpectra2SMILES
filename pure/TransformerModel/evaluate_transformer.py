@@ -127,6 +127,8 @@ def build_model(model_path: str, config: Dict, device: torch.device) -> IRFormul
         encoder_multiscale_target=config.get("encoder_multiscale_target", "mid"),
         encoder_use_coordconv=config.get("encoder_use_coordconv", False),
         encoder_patch_size=config.get("encoder_patch_size", 4),
+        transformer_ffn_type=config.get("transformer_ffn_type", "gelu"),
+        use_formula_input=config.get("use_formula_input", True),
         num_functional_groups=config.get("num_functional_groups", 0),
         use_functional_group_head=config.get("use_functional_group_aux", False),
         use_functional_group_token=config.get("use_functional_group_aux", False)
@@ -1349,8 +1351,8 @@ def main() -> None:
     parser.add_argument("--vocab-path", type=str, default=DEFAULT_VOCAB_PATH)
     parser.add_argument("--split-path", type=str, default=DEFAULT_SPLIT_PATH)
     parser.add_argument("--split", type=str, choices=["all", "train", "val", "test"], default="test")
-    parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--gen-samples", type=int, default=200)
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--gen-samples", type=int, default=10000)
     parser.add_argument("--print-samples", type=int, default=10)
     parser.add_argument("--max-len", type=int, default=120)
     parser.add_argument("--topk", type=int, default=10)
@@ -1588,7 +1590,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
 
 
 
