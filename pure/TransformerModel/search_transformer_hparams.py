@@ -21,6 +21,11 @@ except Exception as exc:  # pragma: no cover - runtime dependency
 from TransformerModel import train_transformer as train_mod
 from util.tokenizer import build_vocab
 
+# Weights & Biases
+USE_WANDB = True
+WANDB_PROJECT = "SearchingHyperParameters"
+WANDB_ENTITY = None  # set to your W&B entity/team or keep None
+WANDB_RUN_NAME = "SearchingHyperParameters"
 
 def ensure_vocab_exists():
     if Path(train_mod.VOCAB_PATH).exists():
@@ -34,6 +39,7 @@ def make_trial_overrides(args, trial: "optuna.trial.Trial", out_dir: Path):
     model_path = trial_dir / "best_transformer_model.pth"
     best_loss_model_path = trial_dir / "best_transformer_loss_model.pth"
     config_path = trial_dir / "transformer_config.json"
+    run_name = f"{WANDB_RUN_NAME}_{args.study_name}_trial_{trial.number:04d}"
 
     return {
         "TRAIN_EPOCH": args.search_epochs,
@@ -51,7 +57,10 @@ def make_trial_overrides(args, trial: "optuna.trial.Trial", out_dir: Path):
         "VAL_SEQ_EM_MAX_SAMPLES": args.val_seq_em_samples,
         "VAL_SEQ_EM_EVERY": args.val_seq_em_every,
         "EARLY_STOP_PATIENCE": args.early_stop_patience,
-        "USE_WANDB": False,
+        "USE_WANDB": USE_WANDB,
+        "WANDB_PROJECT": WANDB_PROJECT,
+        "WANDB_ENTITY": WANDB_ENTITY,
+        "WANDB_RUN_NAME": run_name,
         "REBUILD_VOCAB": False,
         "SAVE_TRAINING_ARTIFACTS": args.save_trial_artifacts,
         "MODEL_PATH": str(model_path),
@@ -73,6 +82,10 @@ def log_trial_start(out_dir: Path, trial: "optuna.trial.Trial", overrides: dict)
             "VAL_SEQ_EM_EVERY": overrides.get("VAL_SEQ_EM_EVERY"),
             "EARLY_STOP_PATIENCE": overrides.get("EARLY_STOP_PATIENCE"),
             "SAVE_TRAINING_ARTIFACTS": overrides.get("SAVE_TRAINING_ARTIFACTS"),
+            "USE_WANDB": overrides.get("USE_WANDB"),
+            "WANDB_PROJECT": overrides.get("WANDB_PROJECT"),
+            "WANDB_ENTITY": overrides.get("WANDB_ENTITY"),
+            "WANDB_RUN_NAME": overrides.get("WANDB_RUN_NAME"),
             "MODEL_PATH": overrides.get("MODEL_PATH"),
             "BEST_LOSS_MODEL_PATH": overrides.get("BEST_LOSS_MODEL_PATH"),
             "CONFIG_PATH": overrides.get("CONFIG_PATH"),
@@ -86,6 +99,9 @@ def log_trial_start(out_dir: Path, trial: "optuna.trial.Trial", overrides: dict)
     print(f"  batch_size: {payload['overrides']['BATCH_SIZE']}")
     print(f"  search_epochs: {payload['overrides']['TRAIN_EPOCH']}")
     print(f"  val_seq_em_samples: {payload['overrides']['VAL_SEQ_EM_MAX_SAMPLES']}")
+    print(f"  wandb_enabled: {payload['overrides']['USE_WANDB']}")
+    print(f"  wandb_project: {payload['overrides']['WANDB_PROJECT']}")
+    print(f"  wandb_run_name: {payload['overrides']['WANDB_RUN_NAME']}")
     print(f"  trial_model_path: {payload['overrides']['MODEL_PATH']}")
 
     with open(out_dir / "trial_start_log.jsonl", "a", encoding="utf-8") as f:
@@ -216,7 +232,7 @@ def parse_args():
     parser.add_argument("--tf-warmup-max", type=int, default=6)
     parser.add_argument("--tf-decay-min", type=int, default=10)
     parser.add_argument("--tf-decay-max", type=int, default=25)
-    parser.add_argument("--patch-sizes", type=int, nargs="+", default=[2, 4, 5, 8])
+    parser.add_argument("--patch-sizes", type=int, nargs="+", default=[4, 5, 8])
     return parser.parse_args()
 
 
@@ -249,6 +265,10 @@ def main():
     print(f"Objective             : {args.objective}")
     print(f"Val seq-em samples    : {args.val_seq_em_samples}")
     print(f"Save trial artifacts  : {args.save_trial_artifacts}")
+    print(f"W&B enabled           : {USE_WANDB}")
+    print(f"W&B project           : {WANDB_PROJECT}")
+    print(f"W&B entity            : {WANDB_ENTITY}")
+    print(f"W&B run prefix        : {WANDB_RUN_NAME}")
     print("=" * 70)
 
     study.optimize(objective_factory(args, out_dir), n_trials=args.n_trials)
